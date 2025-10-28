@@ -1,19 +1,21 @@
 # dockerode
 
-[![NPM](https://nodei.co/npm/dockerode.png?downloads=true&downloadRank=true)](https://nodei.co/npm/dockerode/)
-[![NPM](https://nodei.co/npm-dl/dockerode.png?months=6&height=3)](https://nodei.co/npm/dockerode/)
-
 Not another Node.js Docker Remote API module.
 
-Why `dockerode` is different from other Docker node.js modules:
+`dockerode` objectives:
 
 * **streams** - `dockerode` does NOT break any stream, it passes them to you allowing for some stream voodoo.
-* **stream demux** - Supports optional demultiplexing.
+* **stream demux** - Supports optional [stream demultiplexing](https://github.com/apocas/dockerode#helper-functions).
 * **entities** - containers, images and execs are defined entities and not random static methods.
-* **run** - `dockerode` allow you to seamless run commands in a container ala `docker run`.
+* **run** - `dockerode` allow you to seamless run commands in a container aka `docker run`.
 * **tests** - `dockerode` really aims to have a good test set, allowing to follow `Docker` changes easily, quickly and painlessly.
 * **feature-rich** - There's a real effort in keeping **All** `Docker` Remote API features implemented and tested.
+* **interfaces** - Features **callback** and **promise** based interfaces, making everyone happy :)
 
+## Ecosystem
+
+ * docker-modem [https://github.com/apocas/docker-modem](https://github.com/apocas/docker-modem) - Docker's API network stack
+ * dockerode-compose [https://github.com/apocas/dockerode-compose](https://github.com/apocas/dockerode-compose) - docker-compose in Node.js
 
 ## Installation
 
@@ -21,7 +23,7 @@ Why `dockerode` is different from other Docker node.js modules:
 
 ## Usage
 
- * Input options are directly passed to Docker. Check [Docker Remote API documentation](https://docs.docker.com/reference/api/docker_remote_api/) for more details.
+ * Input options are directly passed to Docker. Check [Docker API documentation](https://docs.docker.com/engine/api/latest/) for more details.
  * Return values are unchanged from Docker, official Docker documentation will also apply to them.
  * Check the tests and examples folder for more examples.
 
@@ -43,7 +45,8 @@ var docker5 = new Docker({
   port: process.env.DOCKER_PORT || 2375,
   ca: fs.readFileSync('ca.pem'),
   cert: fs.readFileSync('cert.pem'),
-  key: fs.readFileSync('key.pem')
+  key: fs.readFileSync('key.pem'),
+  version: 'v1.25' // required when Docker >= v1.13, https://docs.docker.com/engine/api/version-history/
 });
 
 var docker6 = new Docker({
@@ -53,6 +56,12 @@ var docker6 = new Docker({
   ca: fs.readFileSync('ca.pem'),
   cert: fs.readFileSync('cert.pem'),
   key: fs.readFileSync('key.pem')
+});
+
+//using a different promise library (default is the native one)
+var docker7 = new Docker({
+  Promise: require('bluebird')
+  //...
 });
 //...
 ```
@@ -76,7 +85,34 @@ container.remove(function (err, data) {
   console.log(data);
 });
 
-//...
+// promises are supported
+var auxContainer;
+docker.createContainer({
+  Image: 'ubuntu',
+  AttachStdin: false,
+  AttachStdout: true,
+  AttachStderr: true,
+  Tty: true,
+  Cmd: ['/bin/bash', '-c', 'tail -f /var/log/dmesg'],
+  OpenStdin: false,
+  StdinOnce: false
+}).then(function(container) {
+  auxContainer = container;
+  return auxContainer.start();
+}).then(function(data) {
+  return auxContainer.resize({
+    h: process.stdout.rows,
+    w: process.stdout.columns
+  });
+}).then(function(data) {
+  return auxContainer.stop();
+}).then(function(data) {
+  return auxContainer.remove();
+}).then(function(data) {
+  console.log('container removed');
+}).catch(function(err) {
+  console.log(err);
+});
 ```
 
 You may also specify default options for each container's operations, which will always be used for the specified container and operation.
@@ -96,12 +132,32 @@ docker.listContainers(function (err, containers) {
 ```
 
 ### Building an Image
+Context: provides the path to the Dockerfile. Additionaly files that are involved in the build *must* be explicitly mentioned in src array, since they are sent to a temp env to build. Example: file for COPY command are extracted from that temporary environment.  
 
 ``` js
 docker.buildImage('archive.tar', {t: imageName}, function (err, response){
   //...
 });
+
+docker.buildImage({
+  context: __dirname,
+  src: ['Dockerfile', 'file1', 'file2']
+}, {t: imageName}, function (err, response) {
+  //...
+});
 ```
+
+`buildImage` returns a Promise of NodeJS stream. In case you want to find out when the build has finished, you must follow the progress of the build with the `modem` instance in dockerode:
+
+``` js
+let dockerode = new Dockerode();
+let stream = await dockerode.buildImage(...);
+await new Promise((resolve, reject) => {
+  dockerode.modem.followProgress(stream, (err, res) => err ? reject(err) : resolve(res));
+});
+// Build has finished
+```
+
 
 ### Creating a container:
 
@@ -127,7 +183,7 @@ docker.createContainer({ /*...*/ Tty: true /*...*/ }, function(err, container) {
   });
 
   /* ... */
-}
+});
 
 //tty:false
 docker.createContainer({ /*...*/ Tty: false /*...*/ }, function(err, container) {
@@ -140,7 +196,7 @@ docker.createContainer({ /*...*/ Tty: false /*...*/ }, function(err, container) 
   });
 
   /* ... */
-}
+});
 
 docker.createImage({fromImage: 'ubuntu'}, function (err, stream) {
   stream.pipe(process.stdout);
@@ -149,18 +205,53 @@ docker.createImage({fromImage: 'ubuntu'}, function (err, stream) {
 //...
 ```
 
+There is also support for [HTTP connection hijacking](https://docs.docker.com/engine/api/v1.45/#tag/Container/operation/ContainerAttach),
+which allows for cleaner interactions with commands that work with stdin and stdout separately.
+
+```js
+docker.createContainer({Tty: false, /*... other options */}, function(err, container) {
+  container.start(function(err) {
+    container.exec({Cmd: ['shasum', '-'], AttachStdin: true, AttachStdout: true}, function(err, exec) {
+      exec.start({hijack: true, stdin: true}, function(err, stream) {
+        // shasum can't finish until after its stdin has been closed, telling it that it has
+        // read all the bytes it needs to sum. Without a socket upgrade, there is no way to
+        // close the write-side of the stream without also closing the read-side!
+        fs.createReadStream('node-v5.1.0.tgz', 'binary').pipe(stream);
+
+        // Fortunately, we have a regular TCP socket now, so when the readstream finishes and closes our
+        // stream, it is still open for reading and we will still get our results :-)
+        docker.modem.demuxStream(stream, process.stdout, process.stderr);
+      });
+    });
+  });
+});
+```
+
 ### Equivalent of `docker run` in `dockerode`:
 
 * `image` - container image
 * `cmd` - command to be executed
 * `stream` - stream(s) which will be used for execution output.
-* `create_options` - options used for container creation. (optional)
-* `start_options` - options used for container start. (optional)
-* `callback` - callback called when execution ends.
+* `create_options` - (optional) Options used for container creation. Refer to the [DockerEngine ContainerCreate documentation](https://docs.docker.com/engine/api/v1.37/#operation/ContainerCreate) for the possible values
+* `start_options` - (optional) Options used for container start. Refer to the [DockerEngine ContainerStart documentation](https://docs.docker.com/engine/api/v1.37/#operation/ContainerStart) for the possible values
+* `callback` - callback called when execution ends (optional, promise will be returned if not used).
 
 ``` js
+//callback
 docker.run('ubuntu', ['bash', '-c', 'uname -a'], process.stdout, function (err, data, container) {
   console.log(data.StatusCode);
+});
+
+//promise
+docker.run(testImage, ['bash', '-c', 'uname -a'], process.stdout).then(function(data) {
+  var output = data[0];
+  var container = data[1];
+  console.log(output.StatusCode);
+  return container.remove();
+}).then(function(data) {
+  console.log('container removed');
+}).catch(function(err) {
+  console.log(err);
 });
 ```
 
@@ -172,13 +263,22 @@ docker.run('ubuntu', ['bash', '-c', 'uname -a'], [process.stdout, process.stderr
 });
 ```
 
-Run also returns an EventEmitter supporting the following events: container, stream, data. Allowing stuff like this:
+If you provide a callback, `run` will return an EventEmitter supporting the following events: container, stream, data.
+If a callback isn't provided a promise will be returned.
 
 ``` js
 docker.run('ubuntu', ['bash', '-c', 'uname -a'], [process.stdout, process.stderr], {Tty:false}, function (err, data, container) {
   //...
 }).on('container', function (container) {
-  container.defaultOptions.start.Binds = ["/tmp:/tmp:rw"];
+  //...
+});
+```
+
+And here is one more complex example using auto-remove and Docker network.
+
+``` js
+docker.run('some-python-image', ['python', 'main.py', arg], process.stdout, {name: 'my-python-container', HostConfig: { AutoRemove: true, NetworkMode: 'my_network'}}, function(err, data, container) {
+  // Do stuff
 });
 ```
 
@@ -186,11 +286,11 @@ docker.run('ubuntu', ['bash', '-c', 'uname -a'], [process.stdout, process.stderr
 
 * `repoTag` - container image name (optionally with tag)
   `myrepo/myname:withtag`
-* `opts` - extra options passed to create image.
+* `options` - extra options passed to create image.
 * `callback` - callback called when execution ends.
 
 ``` js
-docker.pull('myrepo/myname:tag', function (err, stream) {  
+docker.pull('myrepo/myname:tag', function (err, stream) {
   // streaming output from pull...
 });
 ```
@@ -255,11 +355,165 @@ container.attach({
 });
 ```
 
+## Sponsors
+
+Amazing entities that [sponsor](https://github.com/sponsors/apocas) my open-source work. Check them out!
+
+[![HTTP Toolkit](https://avatars.githubusercontent.com/u/39777515?s=100)](https://github.com/httptoolkit)
+[![OOMOL - Oomol AI Studio](https://avatars.githubusercontent.com/u/146153906?s=100)](https://oomol.com)
+
+## Documentation
+
+### Docker
+
+- docker.createContainer(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerCreate)
+- docker.createImage([auth], options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImageCreate)
+- docker.loadImage(file, options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImageLoad)
+- docker.importImage(file, options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImageCreate)
+- docker.buildImage(file, options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImageBuild)
+- docker.checkAuth(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SystemAuth)
+- docker.getContainer(id) - Returns a Container object.
+- docker.getImage(name) - Returns an Image object.
+- docker.getVolume(name) - Returns a Volume object.
+- docker.getPlugin(name) - Returns a Plugin object.
+- docker.getService(id) - Returns a Service object.
+- docker.getTask(id) - Returns a Task object.
+- docker.getNode(id) - Returns a Node object.
+- docker.getNetwork(id) - Returns a Network object.
+- docker.getSecret(id) - Returns a Secret object.
+- docker.getConfig(id) - Returns a Config object.
+- docker.getExec(id) - Returns a Exec object.
+- docker.listContainers(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerList)
+- docker.listImages(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImageList)
+- docker.listServices(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ServiceList)
+- docker.listNodes(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/NodeList)
+- docker.listTasks(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/TaskList)
+- docker.listSecrets(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SecretList)
+- docker.listConfigs(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ConfigList)
+- docker.listPlugins(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/PluginList)
+- docker.listVolumes(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/VolumeList)
+- docker.listNetworks(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/NetworkList)
+- docker.createSecret(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SecretCreate)
+- docker.createConfig(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ConfigCreate)
+- docker.createPlugin(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/PluginCreate)
+- docker.createVolume(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/VolumeCreate)
+- docker.createService(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ServiceCreate)
+- docker.createNetwork(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/NetworkCreate)
+- docker.pruneImages(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImagePrune)
+- docker.pruneBuilder() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/BuildPrune)
+- docker.pruneContainers(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerPrune)
+- docker.pruneVolumes(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/VolumePrune)
+- docker.pruneNetworks(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/NetworkPrune)
+- docker.searchImages(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImageSearch)
+- docker.info() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SystemInfo)
+- docker.version() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SystemVersion)
+- docker.ping() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SystemPing)
+- docker.df() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SystemDataUsage)
+- docker.getEvents(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SystemEvents)
+- docker.swarmInit(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SwarmInit)
+- docker.swarmJoin(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SwarmJoin)
+- docker.swarmLeave(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SwarmLeave)
+- docker.swarmUpdate(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SwarmUpdate)
+- docker.swarmInspect() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SwarmInspect)
+- docker.pull(repoTag, options, callback, auth) - Like Docker's CLI pull
+- docker.pullAll(repoTag, options, callback, auth) - Like Docker's CLI pull with "-a"
+- docker.run(image, cmd, stream, createOptions, startOptions) - Like Docker's CLI run
+
+
+### Container
+
+- container.inspect(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerInspect)
+- container.rename(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerRename)
+- container.update(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerUpdate)
+- container.top(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerTop)
+- container.changes() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerChanges)
+- container.export() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerExport)
+- container.start(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerStart)
+- container.stop(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerStop)
+- container.pause(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerPause)
+- container.unpause(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerUnpause)
+- container.exec(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerExec)
+- container.commit(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImageCommit)
+- container.restart(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerRestart)
+- container.kill(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerKill)
+- container.resize(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerResize)
+- container.attach(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerAttach)
+- container.wait(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerWait)
+- container.remove(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerDelete)
+- container.getArchive(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerArchive)
+- container.infoArchive(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerArchiveInfo)
+- container.putArchive(file, options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/PutContainerArchive)
+- container.logs(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerLogs)
+- container.stats(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ContainerStats)
+
+### Exec
+
+- exec.start(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ExecStart)
+- exec.resize(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ExecResize)
+- exec.inspect() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ExecInspect)
+
+### Image
+
+- image.inspect(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.48/#tag/Image/operation/ImageInspect)
+- image.history() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImageHistory)
+- image.push(options, callback, auth) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImagePush)
+- image.tag(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImageTag)
+- image.remove(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImageDelete)
+- image.get() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ImageGet)
+
+### Network
+
+- network.inspect() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/NetworkInspect)
+- network.remove(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/NetworkDelete)
+- network.connect(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/NetworkConnect)
+- network.disconnect(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/NetworkDisconnect)
+
+### Node
+
+- node.inspect() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/NodeInspect)
+- node.remove(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/NodeDelete)
+- node.update(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/NodeUpdate)
+
+### Plugin
+
+- plugin.privileges() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/GetPluginPrivileges)
+- plugin.pull(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/PluginPull)
+- plugin.inspect() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/PluginInspect)
+- plugin.remove(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/PluginDelete)
+- plugin.enable(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/PluginEnable)
+- plugin.disable(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/PluginDisable)
+- plugin.update([auth], options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/PluginUpgrade)
+- plugin.push(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/PluginPush)
+- plugin.configure(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/PluginSet)
+
+### Secret
+
+- secret.inspect() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SecretInspect)
+- secret.remove() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SecretDelete)
+- secret.update(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/SecretUpdate)
+
+### Service
+
+- service.inspect() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ServiceInspect)
+- service.remove(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ServiceDelete)
+- service.update(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ServiceUpdate)
+- service.logs(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/ServiceLogs)
+
+### Task
+
+- task.inspect() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/TaskInspect)
+- task.logs(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/Session)
+
+### Volume
+
+- volume.inspect() - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/VolumeInspect)
+- volume.remove(options) - [Docker API Endpoint](https://docs.docker.com/engine/api/v1.37/#operation/VolumeDelete)
+
+
 ## Tests
 
-`docker pull ubuntu:latest` to prepare your system for the tests.
-
-Tests are implemented using `mocha` and `chai`. Run them with `npm test`.
+ * `docker pull ubuntu:latest` to prepare your system for the tests.
+ * Tests are implemented using `mocha` and `chai`. Run them with `npm test`.
 
 ## Examples
 

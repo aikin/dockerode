@@ -1,4 +1,6 @@
 .vagrant
 node_modules
 npm-debug.log
-docker-modem/
+*~
+*.log
+.idea

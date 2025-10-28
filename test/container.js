@@ -3,23 +3,26 @@
 var expect = require('chai').expect;
 var docker = require('./spec_helper').docker;
 var MemoryStream = require('memorystream');
+var Socket = require('net').Socket;
 
 describe("#container", function() {
 
   var testContainer;
   before(function(done) {
+    this.timeout(30000);
     docker.createContainer({
       Image: 'ubuntu',
       AttachStdin: false,
       AttachStdout: true,
       AttachStderr: true,
       Tty: true,
-      Cmd: ['/bin/bash', '-c', 'tail -f /var/log/dmesg'],
+      Cmd: ['/bin/bash', '-c', 'sleep 300'],
       OpenStdin: false,
       StdinOnce: false
     }, function(err, container) {
       if (err) done(err);
       testContainer = container.id;
+      console.log('Created test container ' + container.id);
       done();
     });
   });
@@ -36,6 +39,18 @@ describe("#container", function() {
 
       container.inspect(handler);
     });
+
+    it("should inspect a container with opts", function(done) {
+      var container = docker.getContainer(testContainer);
+
+      function handler(err, data) {
+        expect(err).to.be.null;
+        expect(data).to.be.ok;
+        done();
+      }
+
+      container.inspect({}, handler);
+    });
   });
 
   describe("#archive", function() {
@@ -49,16 +64,15 @@ describe("#container", function() {
       }
 
       container.getArchive({
-        'path': '/var/log/dmesg'
+        'path': '/etc/resolv.conf'
       }, handler);
     });
 
     it("should put an archive inside the container", function(done) {
       var container = docker.getContainer(testContainer);
 
-      function handler(err, data) {
+      function handler(err) {
         expect(err).to.be.null;
-        expect(data).to.be.ok;
         done();
       }
 
@@ -97,6 +111,40 @@ describe("#container", function() {
     });
   });
 
+  describe("#checkpoints", function() {
+    before(function() {
+      if(!process.env.EXPERIMENTAL) {
+        this.skip();
+      }
+    });
+
+    it("should create container checkpoint", function(done) {
+      var container = docker.getContainer(testContainer);
+
+      function handler(err, data) {
+        expect(err).to.be.null;
+        expect(data).to.be.ok;
+        done();
+      }
+
+      container.createCheckpoint({
+        'checkpointID': 'testCheckpoint'
+      }, handler);
+    });
+
+    it("should list containers checkpoints", function(done) {
+      var container = docker.getContainer(testContainer);
+
+      function handler(err, data) {
+        expect(err).to.be.null;
+        expect(data).to.be.ok;
+        done();
+      }
+
+      container.listCheckpoint(handler);
+    });
+  });
+
   describe("#resize", function() {
     it("should resize tty a container", function(done) {
       var container = docker.getContainer(testContainer);
@@ -108,11 +156,26 @@ describe("#container", function() {
 
       container.start(function(err, data) {
         var opts = {
-          h: process.stdout.rows,
-          w: process.stdout.columns
+          h: 10,
+          w: 10
         };
         container.resize(opts, handle);
       });
+    });
+  });
+
+  describe("#update", function() {
+    it("should update a container", function(done) {
+      var container = docker.getContainer(testContainer);
+
+      function handle(err, data) {
+        expect(err).to.be.null;
+        done();
+      }
+
+      container.update({
+        'CpuShares': 512
+      }, handle);
     });
   });
 
@@ -170,7 +233,8 @@ describe("#container", function() {
           stream: true,
           stdin: true,
           stdout: true,
-          stderr: true
+          stderr: true,
+          hijack: true
         };
         container.attach(attach_opts, function handler(err, stream) {
           expect(err).to.be.null;
@@ -187,12 +251,13 @@ describe("#container", function() {
           container.start(function(err, data) {
             expect(err).to.be.null;
 
-            stream.write(randomString(size) + '\n\x04');
+            var aux = randomString(size) + '\n\x04';
+            stream.write(aux);
 
             container.wait(function(err, data) {
               expect(err).to.be.null;
               expect(data).to.be.ok;
-              expect(+output.slice(size + 2)).to.equal(size + 1);
+              expect(+output.slice(size)).to.equal(size + 1);
               done();
             });
           });
@@ -220,7 +285,8 @@ describe("#container", function() {
           stream: true,
           stdin: true,
           stdout: true,
-          stderr: true
+          stderr: true,
+          hijack: true
         };
         container.attach(attach_opts, function handler(err, stream) {
           expect(err).to.be.null;
@@ -276,7 +342,6 @@ describe("#container", function() {
       'VolumesFrom': []
     };
 
-
     it("should attach and wait for a container", function(done) {
       this.timeout(120000);
 
@@ -306,7 +371,7 @@ describe("#container", function() {
             container.wait(function(err, data) {
               expect(err).to.be.null;
               expect(data).to.be.ok;
-              expect(output).to.match(/.*users.*load average.*/);
+              expect(output).to.match(/.*user.*load average.*/);
               done();
             });
           });
@@ -332,7 +397,8 @@ describe("#container", function() {
           stream: true,
           stdin: true,
           stdout: true,
-          stderr: true
+          stderr: true,
+          hijack: true
         };
         container.attach(attach_opts, function handler(err, stream) {
           expect(err).to.be.null;
@@ -354,7 +420,55 @@ describe("#container", function() {
             container.wait(function(err, data) {
               expect(err).to.be.null;
               expect(data).to.be.ok;
-              expect(output).to.match(/.*users.*load average.*/);
+              expect(output).to.match(/.*user.*load average.*/);
+              done();
+            });
+          });
+        });
+      }
+
+      optsc.AttachStdin = true;
+      optsc.OpenStdin = true;
+      optsc.Cmd = ['bash'];
+
+      docker.createContainer(optsc, handler);
+    });
+
+    it("should support attach with hijack and stdin enable", function(done) {
+      this.timeout(120000);
+
+      function handler(err, container) {
+        expect(err).to.be.null;
+        expect(container).to.be.ok;
+
+        var attach_opts = {
+          stream: true,
+          hijack: true,
+          stdin: true,
+          stdout: true,
+          stderr: true
+        };
+        container.attach(attach_opts, function handler(err, stream) {
+          expect(err).to.be.null;
+          expect(stream).to.be.an.instanceof(Socket);
+
+          var memStream = new MemoryStream();
+          var output = '';
+          memStream.on('data', function(data) {
+            output += data.toString();
+          });
+
+          stream.pipe(memStream);
+
+          container.start(function(err, data) {
+            expect(err).to.be.null;
+
+            stream.write("uptime; exit\n");
+
+            container.wait(function(err, data) {
+              expect(err).to.be.null;
+              expect(data).to.be.ok;
+              expect(output).to.match(/.*user.*load average.*/);
               done();
             });
           });
@@ -469,7 +583,7 @@ describe("#container", function() {
 
   describe("#exec", function() {
     it("should run exec on a container", function(done) {
-      this.timeout(10000);
+      this.timeout(20000);
       var options = {
         Cmd: ["echo", "'foo'"]
       };
@@ -489,6 +603,69 @@ describe("#container", function() {
 
             done();
           });
+        });
+      }
+
+      container.exec(options, handler);
+    });
+
+    it("should run resolve exec promise with a stream", function(done) {
+      this.timeout(20000);
+      var options = {
+        Cmd: ["echo", "'foo'"]
+      };
+
+      var container = docker.getContainer(testContainer);
+
+      function handler(err, exec) {
+        expect(err).to.be.null;
+
+        exec.start()
+          .then(stream => {
+            expect(stream.pipe).to.be.ok;
+            done();
+          })
+          .catch(done);
+      }
+
+      container.exec(options, handler);
+    });
+
+    it("should allow exec stream hijacking on a container", function(done) {
+      this.timeout(20000);
+      var options = {
+        Cmd: ["cat"],
+        AttachStdin: true,
+        AttachStdout: true,
+      };
+      var startOpts = {
+        hijack: true
+      };
+
+      var container = docker.getContainer(testContainer);
+
+      function handler(err, exec) {
+        expect(err).to.be.null;
+
+        exec.start(startOpts, function(err, stream) {
+          expect(err).to.be.null;
+          //expect(stream).to.be.ok;
+          expect(stream).to.be.an.instanceof(Socket);
+          //return done();
+
+          var SAMPLE = 'echo\nall\nof\nme\n';
+          var bufs = [];
+          stream.on('data', function(d) {
+            bufs.push(d);
+          }).on('end', function() {
+            var out = Buffer.concat(bufs);
+            expect(out.readUInt8(0)).to.equal(1);
+            expect(out.readUInt32BE(4)).to.equal(SAMPLE.length);
+            expect(out.toString('utf8', 8)).to.equal(SAMPLE);
+            done();
+          });
+          stream.end(SAMPLE);
+          //stream.end();
         });
       }
 
@@ -526,6 +703,74 @@ describe("#container", function() {
       container.stop(handler);
     });
   });
+
+  describe("#wait", function() {
+    var testWaitContainer
+    beforeEach(function(done) {
+      docker.createContainer({
+        Image: 'ubuntu',
+        AttachStdin: false,
+        AttachStdout: true,
+        AttachStderr: true,
+        Tty: true,
+        Cmd: ['/bin/bash', '-c', 'sleep 1'],
+        OpenStdin: false,
+        StdinOnce: false
+      }, function(err, container) {
+        if (err) done(err);
+        testWaitContainer = container.id;
+        console.log('Created test wait container ' + container.id);
+        done();
+      });
+    });
+    it("should accept next-exit condition before start is called", function(done) {
+      this.timeout(30000);
+      var container = docker.getContainer(testWaitContainer);
+
+      container.wait({condition: 'next-exit'}, (err, data) => {
+        expect(err).to.be.null;
+        container.inspect((err, info) => {
+          expect(err).to.be.null;
+          expect(info.State.Running).to.be.false;
+          console.log(info.State.Running)
+          done();
+        })
+      })
+
+      container.start((err) => {
+        expect(err).to.be.null;
+      })
+    });
+    it("should allow aborting pending waits", function(done) {
+      // Only supported on recent Node versions:
+      if (!global.AbortController) this.skip();
+      this.timeout(5000);
+      var container = docker.getContainer(testWaitContainer);
+
+      var abortController = new AbortController();
+
+      container.wait({
+        condition: 'next-exit',
+        abortSignal: abortController.signal
+      }, (err, data) => {
+        expect(err.code).to.equal('ABORT_ERR');
+        expect(data).to.be.null;
+        container.inspect((err, info) => {
+          expect(err).to.be.null;
+          expect(info.State.Running).to.be.false;
+          console.log(info.State.Running)
+          done();
+        })
+      });
+
+      abortController.abort();
+    });
+    afterEach(function(done) {
+      docker.getContainer(testWaitContainer).remove(function() {
+        done();
+      });
+    })
+  });
 });
 
 describe("#non-responsive container", function() {
@@ -548,22 +793,6 @@ describe("#non-responsive container", function() {
     });
   });
 
-  describe("#stop", function() {
-    it("forced after timeout", function(done) {
-      this.timeout(30000);
-      var container = docker.getContainer(testContainer);
-
-      function handler(err, data) {
-        expect(err).not.to.be.null;
-        done();
-      }
-
-      container.stop({
-        t: 1000
-      }, handler);
-    });
-  });
-
   describe("#restart", function() {
     it("forced after timeout", function(done) {
       this.timeout(30000);
@@ -575,7 +804,23 @@ describe("#non-responsive container", function() {
       }
 
       container.restart({
-        t: 1000
+        t: 10
+      }, handler);
+    });
+  });
+
+  describe("#stop", function() {
+    it("forced after timeout", function(done) {
+      this.timeout(30000);
+      var container = docker.getContainer(testContainer);
+
+      function handler(err, data) {
+        expect(err).to.be.null;
+        done();
+      }
+
+      container.stop({
+        t: 10
       }, handler);
     });
   });
